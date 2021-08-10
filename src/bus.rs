@@ -23,14 +23,14 @@ impl Bus {
 	}
 }
 
-pub struct Channel {
-	bus: Arc<Mutex<Bus>>,
+pub struct Channel<T> {
+	bus: Arc<Mutex<T>>,
 	brq: Arc<(Mutex<bool>, Condvar)>,
 	bgr: Arc<(Mutex<bool>, Condvar)>
 }
 
-impl Channel {
-	pub fn new(bus: &Arc<Mutex<Bus>>) -> Channel {
+impl<T> Channel<T> {
+	pub fn new(bus: &Arc<Mutex<T>>) -> Channel<T> {
 		Channel {
 			bus: Arc::clone(&bus),
 			brq: Arc::new((Mutex::new(false), Condvar::new())),
@@ -38,7 +38,7 @@ impl Channel {
 		}
 	}
 	
-	pub fn clone(ch: &Channel) -> Channel {
+	pub fn clone(ch: &Channel<T>) -> Channel<T> {
 		Channel {
 			bus: Arc::clone(&ch.bus),
 			brq: Arc::clone(&ch.brq),
@@ -46,7 +46,7 @@ impl Channel {
 		}
 	}
 	
-	pub fn in_channel<T>(&self, f: fn(&mut Bus) -> T) -> T {
+	pub fn in_channel<U>(&self, f: fn(&mut T) -> U) -> U {
 		let &(ref rlock, ref rcvar) = &*(self.brq);
 		let &(ref glock, ref gcvar) = &*(self.bgr);
 		
