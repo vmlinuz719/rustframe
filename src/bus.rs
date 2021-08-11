@@ -82,12 +82,12 @@ impl Memory32<u32, BusError> for Vec<u8> {
 	}
 }
 
-//
+// Bus: Attach and access multiple Memory32 simulated devices
 
 pub struct Bus {
 	base: Vec<u32>,
 	size: Vec<u32>,
-	region: Vec<Arc<Mutex<dyn Memory32<u32, BusError>>>>
+	region: Vec<Arc<Mutex<dyn Memory32<u32, BusError> + Send>>>
 }
 
 impl Bus {
@@ -100,7 +100,7 @@ impl Bus {
 	}
 	
 	pub fn attach(&mut self, base: u32, size: u32,
-		region: Arc<Mutex<dyn Memory32<u32, BusError>>>) {
+		region: Arc<Mutex<dyn Memory32<u32, BusError> + Send>>) {
 		self.base.push(base);
 		self.size.push(size);
 		self.region.push(region);
