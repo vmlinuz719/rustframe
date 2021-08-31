@@ -43,7 +43,7 @@ pub struct SeriesQ {
 	
 	pub MPK: [u8; 16],
 	
-	pub F: [u8; 16],
+	pub F: [u8; 16], // F0: PLGEVCSB; F8: .......A (..., Application State)
 	
 	pub SDTR_base: u32,
 	pub SDTR_len: u8,
@@ -58,6 +58,102 @@ fn sign_u32(x: u32) -> bool {
 	} else {
 		false
 	}
+}
+
+fn alu_shl(dest: u32, src: u32, flags: u8) -> (u32, u8) {
+	let x = (dest as u64) << (src & 31);
+	let carry = (x >> 32) & 1;
+	let y = (x & 0xFFFFFFFF) as u32;
+	
+	let mut new_flags = flags;
+	// PLGEVCSB
+	if y & 1 == 1 {
+		// odd
+		new_flags |= 0b10000000;
+	} else {
+		// even
+		new_flags &= 0b01111111;
+	}
+	
+	if carry == 1 {
+		new_flags |= 0b00000100;
+	} else {
+		new_flags &= 0b11111011;
+	}
+	
+	(y, new_flags)
+}
+
+fn alu_shr(dest: u32, src: u32, flags: u8) -> (u32, u8) {
+	let x = ((dest as u64) << 32) >> (src & 31);
+	let carry = x & 0x80000000;
+	let y = ((x >> 32) & 0xFFFFFFFF) as u32;
+	
+	let mut new_flags = flags;
+	// PLGEVCSB
+	if y & 1 == 1 {
+		// odd
+		new_flags |= 0b10000000;
+	} else {
+		// even
+		new_flags &= 0b01111111;
+	}
+	
+	if carry != 0 {
+		new_flags |= 0b00000100;
+	} else {
+		new_flags &= 0b11111011;
+	}
+	
+	(y, new_flags)
+}
+
+fn alu_sal(dest: u32, src: u32, flags: u8) -> (u32, u8) {
+	let x = (dest as i64) << (src & 31);
+	let carry = (x >> 32) & 1;
+	let y = (x & 0xFFFFFFFF) as u32;
+	
+	let mut new_flags = flags;
+	// PLGEVCSB
+	if y & 1 == 1 {
+		// odd
+		new_flags |= 0b10000000;
+	} else {
+		// even
+		new_flags &= 0b01111111;
+	}
+	
+	if carry == 1 {
+		new_flags |= 0b00000100;
+	} else {
+		new_flags &= 0b11111011;
+	}
+	
+	(y, new_flags)
+}
+
+fn alu_sar(dest: u32, src: u32, flags: u8) -> (u32, u8) {
+	let x = ((dest as i64) << 32) >> (src & 31);
+	let carry = x & 0x80000000;
+	let y = ((x >> 32) & 0xFFFFFFFF) as u32;
+	
+	let mut new_flags = flags;
+	// PLGEVCSB
+	if y & 1 == 1 {
+		// odd
+		new_flags |= 0b10000000;
+	} else {
+		// even
+		new_flags &= 0b01111111;
+	}
+	
+	if carry != 0 {
+		new_flags |= 0b00000100;
+	} else {
+		new_flags &= 0b11111011;
+	}
+	
+	(y, new_flags)
 }
 
 fn alu_add(dest: u32, src: u32, flags: u8, use_carry: bool) -> (u32, u8) {
@@ -253,6 +349,23 @@ impl SeriesQ {
 		}
 	}
 	
+	fn read_fault(&mut self, iword0: u16, addr: u32) {
+		println!("@{:08X}::{:08X}0x{:04X} READ FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
+		self.running.store(false, Ordering::Relaxed);
+	}
+	fn write_fault(&self, iword0: u16, addr: u32) {
+		println!("@{:08X}::{:08X} 0x{:04X} WRITE FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
+		self.running.store(false, Ordering::Relaxed);
+	}
+	fn seg_fault(&self, iword0: u16, addr: u32) {
+		println!("@{:08X}::{:08X} 0x{:04X} SEGMENTATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
+		self.running.store(false, Ordering::Relaxed);
+	}
+	fn app_fault(&self, iword0: u16, error_code: u32) {
+		println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
+		self.running.store(false, Ordering::Relaxed);
+	}
+	
 	pub fn new() -> SeriesQ {
 		SeriesQ {
 			R: [0; 16],
@@ -287,7 +400,7 @@ impl SeriesQ {
 			while cpu.running.load(Ordering::Relaxed) {
 				// clear zero register
 				cpu.R[0] = 0;
-				// println!("@{:08X}::{:08X}", cpu.S_base[PS], cpu.R[PC]);
+				
 				// TODO: service interrupts
 				
 				// instruction fetch
@@ -349,6 +462,10 @@ impl SeriesQ {
 							cpu.R[rr_reg_d(iword0)] = cpu.R[rr_reg_r(iword0)];
 						},
 						
+						0b00000001 => { // LQ, load quick
+							cpu.R[rr_reg_d(iword0)] = rr_reg_r(iword0) as u32;
+						},
+						
 						0b00000010 => { // BTR, byte truncate
 							cpu.R[rr_reg_d(iword0)] = cpu.R[rr_reg_r(iword0)] & 0xFF;
 						},
@@ -386,7 +503,6 @@ impl SeriesQ {
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
-						
 						0b00001010 => { // S, subtract
 							let (x, flags) = alu_sub(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0], false);
 							cpu.R[rr_reg_d(iword0)] = x;
@@ -397,9 +513,25 @@ impl SeriesQ {
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
-						0b00001100 => { // C, compare
-							let (x, flags) = alu_sub(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0], false);
-							// cpu.R[rr_reg_d(iword0)] = x;
+						
+						0b00001100 => { // AQ, add quick
+							let (x, flags) = alu_add(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0], false);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00001101 => { // AQC, add quick with carry
+							let (x, flags) = alu_add(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0], true);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00001110 => { // SQ, subtract quick
+							let (x, flags) = alu_sub(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0], false);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00001111 => { // SQC, subtract quick with carry
+							let (x, flags) = alu_sub(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0], true);
+							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
 						
@@ -415,6 +547,214 @@ impl SeriesQ {
 						0b00010011 => { // XN, bitwise Xnor
 							cpu.R[rr_reg_d(iword0)] = !(cpu.R[rr_reg_d(iword0)] ^ cpu.R[rr_reg_r(iword0)]);
 						},
+						
+						0b00010100 => { // ANQ, bitwise And quick
+							cpu.R[rr_reg_d(iword0)] &= rr_reg_r(iword0) as u32;
+						},
+						0b00010101 => { // OQ, bitwise Or quick
+							cpu.R[rr_reg_d(iword0)] |= rr_reg_r(iword0) as u32;
+						},
+						0b00010110 => { // XQ, bitwise Xor quick
+							cpu.R[rr_reg_d(iword0)] ^= rr_reg_r(iword0) as u32;
+						},
+						0b00010111 => { // XNQ, bitwise Xnor quick
+							cpu.R[rr_reg_d(iword0)] = !(cpu.R[rr_reg_d(iword0)] ^ rr_reg_r(iword0) as u32);
+						},
+						
+						0b00011000 => { // SL, logical shift left
+							let (x, flags) = alu_shl(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00011001 => { // SR, logical shift right
+							let (x, flags) = alu_shr(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00011010 => { // ASL, arithmetic shift left
+							let (x, flags) = alu_sal(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00011011 => { // ASR, arithmetic shift right
+							let (x, flags) = alu_sar(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						
+						0b00011100 => { // SLQ, logical quick shift left
+							let (x, flags) = alu_shl(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00011101 => { // SRQ, logical quick shift right
+							let (x, flags) = alu_shr(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00011110 => { // ASLQ, arithmetic quick shift left
+							let (x, flags) = alu_sal(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						0b00011111 => { // ASRQ, arithmetic quick shift right
+							let (x, flags) = alu_sar(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						
+						0b00100000 => { // C, compare
+							let (x, flags) = alu_sub(cpu.R[rr_reg_d(iword0)], cpu.R[rr_reg_r(iword0)], cpu.F[0], false);
+							// cpu.R[rr_reg_d(iword0)] = x;
+							cpu.F[0] = flags;
+						},
+						
+						0b00100010 => { // LF, load flag registers
+							cpu.R[rr_reg_d(iword0)] = cpu.F[rr_reg_r(iword0)] as u32;
+						},
+						0b00100011 => { // SF, save flag registers
+							if cpu.F[8] & 0b00000001 != 0 && rr_reg_r(iword0) >= 8 {
+								// TODONE: handle application fault
+								// println!("@{:08X}::{:08X} APPLICATION FAULT SF", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								// cpu.running.store(false, Ordering::Relaxed);
+								
+								cpu.app_fault(iword0, 0x1BADF00D);
+							} else {
+								cpu.F[rr_reg_d(iword0)] = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
+							}
+						},
+						
+						0b00100100 => { // LSDTR, load Segment Descriptor Table registers 
+							if cpu.F[8] & 0b00000001 != 0 {
+								// TODO: handle application fault
+								println!("@{:08X}::{:08X} APPLICATION FAULT LSDTR", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								cpu.running.store(false, Ordering::Relaxed);
+							} else {
+								cpu.R[rr_reg_r(iword0)] = cpu.SDTR_len as u32;
+								cpu.R[rr_reg_d(iword0)] = cpu.SDTR_base;
+							}
+						},
+						0b00100101 => { // SSDTR, set Segment Descriptor Table registers 
+							if cpu.F[8] & 0b00000001 != 0 {
+								// TODO: handle application fault
+								println!("@{:08X}::{:08X} APPLICATION FAULT SSDTR", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								cpu.running.store(false, Ordering::Relaxed);
+							} else {
+								cpu.SDTR_len = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
+								cpu.SDTR_base = cpu.R[rr_reg_d(iword0)];
+							}
+						},
+						
+						0b00100110 => { // LSEL, load segment selector
+							cpu.R[rr_reg_d(iword0)] = cpu.S_selector[rr_reg_r(iword0)] as u32;
+						}
+						0b00100111 => { // SSEL, set segment selector
+							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) || ((cpu.R[rr_reg_r(iword0)] & 0xFF) as u8) > cpu.SDTR_len {
+								// TODO: handle application fault
+								println!("@{:08X}::{:08X} APPLICATION FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								cpu.running.store(false, Ordering::Relaxed);
+							} else {
+								cpu.S_selector[rr_reg_d(iword0)] = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
+								
+								// ugh
+								let mut ok = true;
+								
+								// read S_base
+								let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF);
+								match held_bus.read_w(addr) {
+									Err(_) => {
+										// TODO: handle read fault
+										println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
+										// for now
+										cpu.running.store(false, Ordering::Relaxed);
+										ok = false;
+									},
+									Ok(x) => { cpu.S_base[rr_reg_d(iword0)] = x; },
+								};
+								
+								if ok {
+									// read S_limit
+									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 4;
+									match held_bus.read_w(addr) {
+										Err(_) => {
+											// TODO: handle read fault
+											println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
+											// for now
+											cpu.running.store(false, Ordering::Relaxed);
+											ok = false;
+										},
+										Ok(x) => { cpu.S_limit[rr_reg_d(iword0)] = x; },
+									};
+								}
+								
+								if ok {
+									// read S_key
+									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 8;
+									match held_bus.read_b(addr) {
+										Err(_) => {
+											// TODO: handle read fault
+											println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
+											// for now
+											cpu.running.store(false, Ordering::Relaxed);
+											ok = false;
+										},
+										Ok(x) => { cpu.S_key[rr_reg_d(iword0)] = x; },
+									};
+								}
+								
+								if ok {
+									// read S_flags
+									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 9;
+									match held_bus.read_b(addr) {
+										Err(_) => {
+											// TODO: handle read fault
+											println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
+											// for now
+											cpu.running.store(false, Ordering::Relaxed);
+											ok = false;
+										},
+										Ok(x) => { cpu.S_flags[rr_reg_d(iword0)] = x; },
+									};
+								}
+								
+							}
+						}
+						
+						0b00101000 => { // LMPK, get memory protection key
+							if (cpu.F[8] & 0b00000001 != 0) {
+								// TODO: handle application fault
+								println!("@{:08X}::{:08X} APPLICATION FAULT LMPK", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								cpu.running.store(false, Ordering::Relaxed);
+							} else {
+								cpu.R[rr_reg_d(iword0)] = cpu.MPK[rr_reg_r(iword0)] as u32;
+							}
+						}
+						0b00101001 => { // SMPK, get memory protection key
+							if (cpu.F[8] & 0b00000001 != 0) {
+								// TODO: handle application fault
+								println!("@{:08X}::{:08X} APPLICATION FAULT SMPK", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								cpu.running.store(false, Ordering::Relaxed);
+							} else {
+								cpu.MPK[rr_reg_d(iword0)] = cpu.R[rr_reg_r(iword0)] as u8;
+							}
+						}
+						
+						0b00101010 => { // CSEL, copy segment selector
+							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) {
+								// TODO: handle application fault
+								println!("@{:08X}::{:08X} APPLICATION FAULT CSEL", cpu.S_base[PS], cpu.R[PC]);
+								// for now
+								cpu.running.store(false, Ordering::Relaxed);
+							} else {
+								cpu.copy_segment(rr_reg_d(iword0), rr_reg_r(iword0));
+							}
+						}
 						
 						0b00111110 => { // IF, conditionally execute next instruction
 							let mask = (iword0 & 0xFF) as u8;
@@ -450,7 +790,7 @@ impl SeriesQ {
 							}
 						},
 						0b01000001 => { // RMX LA, load address
-							cpu.R[rr_reg_d(iword0)] = cpu.gen_offset_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));;
+							cpu.R[rr_reg_d(iword0)] = cpu.gen_offset_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 						},
 						
 						0b01000010 => { // RMX BTR, byte truncate
