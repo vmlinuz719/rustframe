@@ -1,13 +1,15 @@
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Condvar};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::{thread, time};
-use crate::bus::{Bus, Memory32, BusError};
+use crate::bus::{Bus, Channel, Memory32, BusError};
 
 pub const PC: usize = 15;
 pub const LR: usize = 14;
 
-pub const PS: usize = 15;
-pub const LS: usize = 14;
+pub const PS: usize = 7;
+pub const LS: usize = 6;
+
+pub const SUPERVISOR_ACCESS: i32 = -1;
 
 // functions for instruction decode
 fn rr_reg_d(iword: u16) -> usize {
@@ -49,7 +51,10 @@ pub struct SeriesQ {
 	pub SDTR_len: u8,
 	
 	pub running: Arc<AtomicBool>,
-	pub cycles: u64
+	pub cycles: u64,
+	
+	pub bus: Arc<Mutex<Bus>>,
+	pub channels: Vec<Channel<Bus>>
 }
 
 fn sign_u32(x: u32) -> bool {
@@ -326,7 +331,7 @@ impl SQAddr for SeriesQ	{
 	}
 	
 	fn access_check(&self, segment: usize, addr: u32, write: bool, exec: bool) -> bool {
-		self.MPK.contains(&self.S_key[segment])
+		(self.MPK.contains(&self.S_key[segment]) || &self.F[8] & 1 == 0)
 			&& addr >= self.S_base[segment]
 			&& addr < self.S_limit[segment]
 	}
@@ -350,7 +355,7 @@ impl SeriesQ {
 	}
 	
 	fn read_fault(&mut self, iword0: u16, addr: u32) {
-		println!("@{:08X}::{:08X}0x{:04X} READ FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
+		println!("@{:08X}::{:08X} 0x{:04X} READ FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
 		self.running.store(false, Ordering::Relaxed);
 	}
 	fn write_fault(&self, iword0: u16, addr: u32) {
@@ -365,16 +370,35 @@ impl SeriesQ {
 		println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
 		self.running.store(false, Ordering::Relaxed);
 	}
+	fn sys_fault(&self, iword0: u16, error_code: u32) {
+		println!("@{:08X}::{:08X} 0x{:04X} SYSTEM FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
+		self.running.store(false, Ordering::Relaxed);
+	}
 	
-	pub fn new() -> SeriesQ {
-		SeriesQ {
+	pub fn new(bus: Arc<Mutex<Bus>>) -> SeriesQ {
+		let mut result = SeriesQ {
 			R: [0; 16],
 			
 			S_selector: [0; 16],
 			S_base: [0; 16],
 			S_limit: [0xFFFFFFFF; 16],
 			S_key: [0xFF; 16],
-			S_flags: [0xF0; 16],
+			S_flags: [0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xF0,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xFF,
+					  0xF0],
 			
 			MPK: [0xFF; 16],
 			
@@ -384,17 +408,28 @@ impl SeriesQ {
 			SDTR_len: 0,
 			
 			running: Arc::new(AtomicBool::new(false)),
-			cycles: 0
+			cycles: 0,
+			
+			bus: bus,
+			channels: Vec::new()
+			
+		};
+		
+		for _ in 0..16 {
+			result.channels.push(Channel::new(&result.bus));
 		}
+		
+		result
 	}
 	
-	pub fn run(cpu: Arc<Mutex<SeriesQ>>, bus: Arc<Mutex<Bus>>) {
+	pub fn run(cpu: Arc<Mutex<SeriesQ>>) {
 		thread::spawn(move || {
 			let mut cpu = cpu.lock().unwrap();
 			cpu.cycles = 0;
 			let mut skip = false;
 			
-			let mut held_bus = bus.lock().unwrap();
+			let mut our_bus = Arc::clone(&cpu.bus);
+			let mut held_bus = our_bus.lock().unwrap();
 			println!("CPU START, {} devices attached to bus", held_bus.region.len());
 			cpu.running.store(true, Ordering::Relaxed);
 			while cpu.running.load(Ordering::Relaxed) {
@@ -583,22 +618,22 @@ impl SeriesQ {
 						},
 						
 						0b00011100 => { // SLQ, logical quick shift left
-							let (x, flags) = alu_shl(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							let (x, flags) = alu_shl(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 1, cpu.F[0]);
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
 						0b00011101 => { // SRQ, logical quick shift right
-							let (x, flags) = alu_shr(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							let (x, flags) = alu_shr(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 1, cpu.F[0]);
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
 						0b00011110 => { // ASLQ, arithmetic quick shift left
-							let (x, flags) = alu_sal(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							let (x, flags) = alu_sal(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 1, cpu.F[0]);
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
 						0b00011111 => { // ASRQ, arithmetic quick shift right
-							let (x, flags) = alu_sar(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32, cpu.F[0]);
+							let (x, flags) = alu_sar(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 1, cpu.F[0]);
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
@@ -619,7 +654,7 @@ impl SeriesQ {
 								// for now
 								// cpu.running.store(false, Ordering::Relaxed);
 								
-								cpu.app_fault(iword0, 0x1BADF00D);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.F[rr_reg_d(iword0)] = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
 							}
@@ -627,10 +662,7 @@ impl SeriesQ {
 						
 						0b00100100 => { // LSDTR, load Segment Descriptor Table registers 
 							if cpu.F[8] & 0b00000001 != 0 {
-								// TODO: handle application fault
-								println!("@{:08X}::{:08X} APPLICATION FAULT LSDTR", cpu.S_base[PS], cpu.R[PC]);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.R[rr_reg_r(iword0)] = cpu.SDTR_len as u32;
 								cpu.R[rr_reg_d(iword0)] = cpu.SDTR_base;
@@ -638,10 +670,7 @@ impl SeriesQ {
 						},
 						0b00100101 => { // SSDTR, set Segment Descriptor Table registers 
 							if cpu.F[8] & 0b00000001 != 0 {
-								// TODO: handle application fault
-								println!("@{:08X}::{:08X} APPLICATION FAULT SSDTR", cpu.S_base[PS], cpu.R[PC]);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.SDTR_len = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
 								cpu.SDTR_base = cpu.R[rr_reg_d(iword0)];
@@ -653,10 +682,7 @@ impl SeriesQ {
 						}
 						0b00100111 => { // SSEL, set segment selector
 							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) || ((cpu.R[rr_reg_r(iword0)] & 0xFF) as u8) > cpu.SDTR_len {
-								// TODO: handle application fault
-								println!("@{:08X}::{:08X} APPLICATION FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.S_selector[rr_reg_d(iword0)] = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
 								
@@ -667,10 +693,7 @@ impl SeriesQ {
 								let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF);
 								match held_bus.read_w(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 										ok = false;
 									},
 									Ok(x) => { cpu.S_base[rr_reg_d(iword0)] = x; },
@@ -681,10 +704,7 @@ impl SeriesQ {
 									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 4;
 									match held_bus.read_w(addr) {
 										Err(_) => {
-											// TODO: handle read fault
-											println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
-											// for now
-											cpu.running.store(false, Ordering::Relaxed);
+											cpu.read_fault(iword0, addr);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_limit[rr_reg_d(iword0)] = x; },
@@ -696,10 +716,7 @@ impl SeriesQ {
 									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 8;
 									match held_bus.read_b(addr) {
 										Err(_) => {
-											// TODO: handle read fault
-											println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
-											// for now
-											cpu.running.store(false, Ordering::Relaxed);
+											cpu.read_fault(iword0, addr);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_key[rr_reg_d(iword0)] = x; },
@@ -711,10 +728,7 @@ impl SeriesQ {
 									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 9;
 									match held_bus.read_b(addr) {
 										Err(_) => {
-											// TODO: handle read fault
-											println!("@{:08X}::{:08X} READ FAULT SSEL", cpu.S_base[PS], cpu.R[PC]);
-											// for now
-											cpu.running.store(false, Ordering::Relaxed);
+											cpu.read_fault(iword0, addr);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_flags[rr_reg_d(iword0)] = x; },
@@ -726,20 +740,14 @@ impl SeriesQ {
 						
 						0b00101000 => { // LMPK, get memory protection key
 							if (cpu.F[8] & 0b00000001 != 0) {
-								// TODO: handle application fault
-								println!("@{:08X}::{:08X} APPLICATION FAULT LMPK", cpu.S_base[PS], cpu.R[PC]);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.R[rr_reg_d(iword0)] = cpu.MPK[rr_reg_r(iword0)] as u32;
 							}
 						}
 						0b00101001 => { // SMPK, get memory protection key
 							if (cpu.F[8] & 0b00000001 != 0) {
-								// TODO: handle application fault
-								println!("@{:08X}::{:08X} APPLICATION FAULT SMPK", cpu.S_base[PS], cpu.R[PC]);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.MPK[rr_reg_d(iword0)] = cpu.R[rr_reg_r(iword0)] as u8;
 							}
@@ -747,12 +755,66 @@ impl SeriesQ {
 						
 						0b00101010 => { // CSEL, copy segment selector
 							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) {
-								// TODO: handle application fault
-								println!("@{:08X}::{:08X} APPLICATION FAULT CSEL", cpu.S_base[PS], cpu.R[PC]);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
 							} else {
 								cpu.copy_segment(rr_reg_d(iword0), rr_reg_r(iword0));
+							}
+						}
+						0b00101011 => { // SSELHC, set segment selector
+							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) || ((rr_reg_r(iword0) & 0xFF) as u8) > cpu.SDTR_len {
+								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
+							} else {
+								cpu.S_selector[rr_reg_d(iword0)] = ((rr_reg_r(iword0) as u32) & 0xFF) as u8;
+								
+								// ugh
+								let mut ok = true;
+								
+								// read S_base
+								let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF);
+								match held_bus.read_w(addr) {
+									Err(_) => {
+										cpu.read_fault(iword0, addr);
+										ok = false;
+									},
+									Ok(x) => { cpu.S_base[rr_reg_d(iword0)] = x; },
+								};
+								
+								if ok {
+									// read S_limit
+									let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF) + 4;
+									match held_bus.read_w(addr) {
+										Err(_) => {
+											cpu.read_fault(iword0, addr);
+											ok = false;
+										},
+										Ok(x) => { cpu.S_limit[rr_reg_d(iword0)] = x; },
+									};
+								}
+								
+								if ok {
+									// read S_key
+									let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF) + 8;
+									match held_bus.read_b(addr) {
+										Err(_) => {
+											cpu.read_fault(iword0, addr);
+											ok = false;
+										},
+										Ok(x) => { cpu.S_key[rr_reg_d(iword0)] = x; },
+									};
+								}
+								
+								if ok {
+									// read S_flags
+									let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF) + 9;
+									match held_bus.read_b(addr) {
+										Err(_) => {
+											cpu.read_fault(iword0, addr);
+											ok = false;
+										},
+										Ok(x) => { cpu.S_flags[rr_reg_d(iword0)] = x; },
+									};
+								}
+								
 							}
 						}
 						
@@ -775,18 +837,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_w(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX L 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x; },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX L 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01000001 => { // RMX LA, load address
@@ -798,18 +854,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX BTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX BTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01000011 => { // RMX HTR, half truncate
@@ -817,18 +867,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX HTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX HTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -837,10 +881,7 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX BSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -850,10 +891,7 @@ impl SeriesQ {
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX BSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01000101 => { // RMX HSF, half sign extend
@@ -861,10 +899,7 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX HSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -874,10 +909,7 @@ impl SeriesQ {
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX HSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -886,20 +918,14 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX BNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFFFF00) | (x as u32);
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX BNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01000111 => { // RMX HNS, half insert
@@ -907,20 +933,14 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RMX HNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFF0000) | (x as u32);
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX HNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -929,18 +949,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_w(addr, cpu.R[rr_reg_d(iword0)]) {
 									Err(_) => {
-										// TODO: handle write fault
-										println!("@{:08X}::{:08X} WRITE FAULT RMX ST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.write_fault(iword0, addr);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX ST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01001001 => { // RMX BST, store byte
@@ -948,18 +962,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_b(addr, (cpu.R[rr_reg_d(iword0)] & 0xFF) as u8) {
 									Err(_) => {
-										// TODO: handle write fault
-										println!("@{:08X}::{:08X} WRITE FAULT RMX BST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.write_fault(iword0, addr);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX BST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01001010 => { // RMX HST, store half
@@ -967,18 +975,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_h(addr, (cpu.R[rr_reg_d(iword0)] & 0xFFFF) as u16) {
 									Err(_) => {
-										// TODO: handle write fault
-										println!("@{:08X}::{:08X} WRITE FAULT RMX HST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.write_fault(iword0, addr);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RMX HST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -995,21 +997,16 @@ impl SeriesQ {
 						// RM
 						0b01100000 => { // RM L, load word
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
+							println!("{:08X}", addr);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_w(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM L 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
-									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x; },
+									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x;},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM L 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01100001 => { // RM LA, load address
@@ -1021,18 +1018,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM BTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM BTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01100011 => { // RM HTR, half truncate
@@ -1040,18 +1031,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM HTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM HTR 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -1060,10 +1045,7 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM BSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -1073,10 +1055,7 @@ impl SeriesQ {
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM BSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01100101 => { // RM HSF, half sign extend
@@ -1084,10 +1063,7 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM HSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -1097,10 +1073,7 @@ impl SeriesQ {
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM HSF 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -1109,20 +1082,14 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM BNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFFFF00) | (x as u32);
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM BNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01100111 => { // RM HNS, half insert
@@ -1130,20 +1097,14 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
 									Err(_) => {
-										// TODO: handle read fault
-										println!("@{:08X}::{:08X} READ FAULT RM HNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.read_fault(iword0, addr);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFF0000) | (x as u32);
 									},
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM HNS 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -1152,18 +1113,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_w(addr, cpu.R[rr_reg_d(iword0)]) {
 									Err(_) => {
-										// TODO: handle write fault
-										println!("@{:08X}::{:08X} WRITE FAULT RM ST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.write_fault(iword0, addr);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM ST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01101001 => { // RM BST, store byte
@@ -1171,18 +1126,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_b(addr, (cpu.R[rr_reg_d(iword0)] & 0xFF) as u8) {
 									Err(_) => {
-										// TODO: handle write fault
-										println!("@{:08X}::{:08X} WRITE FAULT RM BST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.write_fault(iword0, addr);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM BST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						0b01101010 => { // RM HST, store half
@@ -1190,18 +1139,12 @@ impl SeriesQ {
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_h(addr, (cpu.R[rr_reg_d(iword0)] & 0xFFFF) as u16) {
 									Err(_) => {
-										// TODO: handle write fault
-										println!("@{:08X}::{:08X} WRITE FAULT RM HST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-										// for now
-										cpu.running.store(false, Ordering::Relaxed);
+										cpu.write_fault(iword0, addr);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
 							} else {
-								// TODO: handle segmentation fault
-								println!("@{:08X}::{:08X} SEGMENTATION FAULT RM HST 0x{:08X}", cpu.S_base[PS], cpu.R[PC], addr);
-								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.seg_fault(iword0, addr);
 							}
 						},
 						
@@ -1226,6 +1169,14 @@ impl SeriesQ {
 				}
 				
 				// TODO: service DMA
+				
+				for c in &cpu.channels {
+					if c.check_pending() {
+						drop(held_bus);
+						c.open();
+						held_bus = our_bus.lock().unwrap();
+					}
+				}
 				
 				cpu.cycles = cpu.cycles.wrapping_add(1);
 			}
