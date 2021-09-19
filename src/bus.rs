@@ -13,6 +13,7 @@ pub enum BusError {
 pub trait Memory32<A, E> {
 	fn read_b(&self, addr: A) -> Result<u8, E>;
 	fn read_h(&self, addr: A) -> Result<u16, E>;
+	fn read_h_big(&self, addr: A) -> Result<u16, E>;
 	fn read_w(&self, addr: A) -> Result<u32, E>;
 	
 	fn write_b(&mut self, addr: A, data: u8) -> Result<(), E>;
@@ -37,13 +38,22 @@ impl Memory32<u32, BusError> for Vec<u8> {
 			Ok(((self[(addr + 1) as usize] as u16) << 8) + (self[addr as usize] as u16))
 		}
 	}
+	fn read_h_big(&self, addr: u32) -> Result<u16, BusError> {
+		if addr + 1 >= self.len() as u32 {
+			Err(BusError::InvalidAddress)
+		} else if addr % 2 != 0 {
+			Err(BusError::AlignmentCheck)
+		} else {
+			Ok(((self[addr as usize] as u16) << 8) + (self[(addr + 1) as usize] as u16))
+		}
+	}
 	fn read_w(&self, addr: u32) -> Result<u32, BusError> {
 		if addr + 3 >= self.len() as u32 {
 			Err(BusError::InvalidAddress)
 		} else if addr % 4 != 0 {
 			Err(BusError::AlignmentCheck)
 		} else {
-			Ok(((self[(addr + 3) as usize] as u32) << 3) + ((self[(addr + 2) as usize] as u32) << 8)
+			Ok(((self[(addr + 3) as usize] as u32) << 24) + ((self[(addr + 2) as usize] as u32) << 16)
 				+ ((self[(addr + 1) as usize] as u32) << 8) + (self[addr as usize] as u32))
 		}
 	}
@@ -87,7 +97,7 @@ impl Memory32<u32, BusError> for Vec<u8> {
 pub struct Bus {
 	base: Vec<u32>,
 	size: Vec<u32>,
-	region: Vec<Arc<Mutex<dyn Memory32<u32, BusError> + Send>>>
+	pub region: Vec<Arc<Mutex<dyn Memory32<u32, BusError> + Send>>>,
 }
 
 impl Bus {
@@ -122,6 +132,15 @@ impl Memory32<u32, BusError> for Bus {
 			if addr >= self.base[n] && addr < self.base[n] + self.size[n] {
 				let mem = self.region[n].lock().unwrap();
 				return mem.read_h(addr - self.base[n]);
+			}
+		}
+		return Err(BusError::InvalidAddress);
+	}
+	fn read_h_big(&self, addr: u32) -> Result<u16, BusError> {
+		for n in 0..self.base.len() {
+			if addr >= self.base[n] && addr < self.base[n] + self.size[n] {
+				let mem = self.region[n].lock().unwrap();
+				return mem.read_h_big(addr - self.base[n]);
 			}
 		}
 		return Err(BusError::InvalidAddress);
@@ -190,7 +209,8 @@ impl<T> Channel<T> {
 		}
 	}
 	
-	pub fn in_channel<U>(&self, f: fn(&mut T) -> U) -> U {
+	pub fn in_channel<F, U>(&self, mut f: F) -> U 
+	where F: FnMut(&mut T) -> U {
 		let &(ref rlock, ref rcvar) = &*(self.brq);
 		let &(ref glock, ref gcvar) = &*(self.bgr);
 		
