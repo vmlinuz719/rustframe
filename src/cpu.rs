@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex, Condvar};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::{thread, time};
 use crate::bus::{Bus, Channel, Memory32, BusError};
 
@@ -10,6 +10,11 @@ pub const PS: usize = 7;
 pub const LS: usize = 6;
 
 pub const SUPERVISOR_ACCESS: i32 = -1;
+pub const OUT_OF_BOUNDS: i32 = -2;
+pub const ILLEGAL_INSTRUCTION: i32 = -3;
+pub const SEGMENTATION_FAULT: i32 = -4;
+pub const READ_FAULT: i32 = -5;
+pub const WRITE_FAULT: i32 = -6;
 
 // functions for instruction decode
 fn rr_reg_d(iword: u16) -> usize {
@@ -45,16 +50,22 @@ pub struct SeriesQ {
 	
 	pub MPK: [u8; 16],
 	
-	pub F: [u8; 16], // F0: PLGEVCSB; F8: .......A (..., Application State)
+	pub F: [u8; 16], // F0: PLGEVCSB; F8: .F__P__A (..., Fault Priority Level, Current Priority Level, Application State)
+					 // F10, F11: Fault Instruction; F12-F15: Fault Address
 	
 	pub SDTR_base: u32,
 	pub SDTR_len: u8,
+	
+	pub PEBA_base: u32,
+	pub PLBA_base: u32,
 	
 	pub running: Arc<AtomicBool>,
 	pub cycles: u64,
 	
 	pub bus: Arc<Mutex<Bus>>,
-	pub channels: Vec<Channel<Bus>>
+	pub channels: Vec<Channel<Bus>>,
+	pub ipl: Vec<Arc<AtomicBool>>,
+	pub icode: Vec<Arc<AtomicU8>>,
 }
 
 fn sign_u32(x: u32) -> bool {
@@ -331,9 +342,25 @@ impl SQAddr for SeriesQ	{
 	}
 	
 	fn access_check(&self, segment: usize, addr: u32, write: bool, exec: bool) -> bool {
-		(self.MPK.contains(&self.S_key[segment]) || &self.F[8] & 1 == 0)
+		let segment_check = (self.MPK.contains(&self.S_key[segment]) || &self.F[8] & 1 == 0)
 			&& addr >= self.S_base[segment]
-			&& addr < self.S_limit[segment]
+			&& addr < self.S_limit[segment];
+		
+		let read_allowed = (self.S_flags[segment] & 0b10000000 != 0);
+		let write_allowed = (self.S_flags[segment] & 0b01000000 != 0);
+		let exec_allowed = (self.S_flags[segment] & 0b00100000 != 0);
+		
+		if &self.F[8] & 1 != 0 { // if application state
+			if write {
+				segment_check && write_allowed
+			} else if exec {
+				segment_check && exec_allowed
+			} else {
+				segment_check && read_allowed
+			}
+		} else {
+			segment_check
+		}
 	}
 }
 
@@ -355,24 +382,61 @@ impl SeriesQ {
 	}
 	
 	fn read_fault(&mut self, iword0: u16, addr: u32) {
-		println!("@{:08X}::{:08X} 0x{:04X} READ FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
-		self.running.store(false, Ordering::Relaxed);
+		self.F[12] = (addr & 0xFF) as u8;
+		self.F[13] = ((addr & 0xFF00) >> 8) as u8;
+		self.F[14] = ((addr & 0xFF0000) >> 16) as u8;
+		self.F[15] = ((addr & 0xFF000000) >> 24) as u8;
+		self.app_fault(iword0, READ_FAULT as u32);
 	}
-	fn write_fault(&self, iword0: u16, addr: u32) {
-		println!("@{:08X}::{:08X} 0x{:04X} WRITE FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
-		self.running.store(false, Ordering::Relaxed);
+	fn write_fault(&mut self, iword0: u16, addr: u32) {
+		self.F[12] = (addr & 0xFF) as u8;
+		self.F[13] = ((addr & 0xFF00) >> 8) as u8;
+		self.F[14] = ((addr & 0xFF0000) >> 16) as u8;
+		self.F[15] = ((addr & 0xFF000000) >> 24) as u8;
+		self.app_fault(iword0, WRITE_FAULT as u32);
 	}
-	fn seg_fault(&self, iword0: u16, addr: u32) {
-		println!("@{:08X}::{:08X} 0x{:04X} SEGMENTATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
-		self.running.store(false, Ordering::Relaxed);
+	fn seg_fault(&mut self, iword0: u16, addr: u32) {
+		self.F[12] = (addr & 0xFF) as u8;
+		self.F[13] = ((addr & 0xFF00) >> 8) as u8;
+		self.F[14] = ((addr & 0xFF0000) >> 16) as u8;
+		self.F[15] = ((addr & 0xFF000000) >> 24) as u8;
+		self.app_fault(iword0, SEGMENTATION_FAULT as u32);
 	}
-	fn app_fault(&self, iword0: u16, error_code: u32) {
-		println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
-		self.running.store(false, Ordering::Relaxed);
+	fn app_fault(&mut self, iword0: u16, error_code: u32) {
+		if self.F[8] & 1 == 0 {
+			// we are in supervisor state
+			self.sys_fault(iword0, error_code);
+		} else {
+			// TODO: priority level nonsense
+			println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
+			
+			let new_pl = (self.F[8] & 0x70) >> 4;
+			
+			self.S_selector[PS] = (error_code & 0xFF) as u8;
+			self.F[10] = (iword0 & 0xFF) as u8;
+			self.F[11] = ((iword0 & 0xFF00) >> 8) as u8;
+			self.running.store(false, Ordering::Relaxed);
+			
+			if (self.F[8] & 0xE) >> 1 == 7 {
+				self.running.store(false, Ordering::Relaxed);
+			} else {
+				self.ipl[new_pl as usize].store(true, Ordering::Relaxed);
+				self.icode[new_pl as usize].store((error_code & 0xFF) as u8, Ordering::Relaxed);
+			}
+		}
 	}
-	fn sys_fault(&self, iword0: u16, error_code: u32) {
+	fn sys_fault(&mut self, iword0: u16, error_code: u32) {
 		println!("@{:08X}::{:08X} 0x{:04X} SYSTEM FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
-		self.running.store(false, Ordering::Relaxed);
+		self.F[10] = (iword0 & 0xFF) as u8;
+		self.F[11] = ((iword0 & 0xFF00) >> 8) as u8;
+		
+		// we should never get here; escalate to max pl or halt
+		if (self.F[8] & 0xE) >> 1 == 7 {
+			self.running.store(false, Ordering::Relaxed);
+		} else {
+			self.ipl[7].store(true, Ordering::Relaxed);
+			self.icode[7].store((error_code & 0xFF) as u8, Ordering::Relaxed);
+		}
 	}
 	
 	pub fn new(bus: Arc<Mutex<Bus>>) -> SeriesQ {
@@ -390,7 +454,7 @@ impl SeriesQ {
 					  0xFF,
 					  0xFF,
 					  0xFF,
-					  0xF0,
+					  0x00,
 					  0xFF,
 					  0xFF,
 					  0xFF,
@@ -402,24 +466,213 @@ impl SeriesQ {
 			
 			MPK: [0xFF; 16],
 			
-			F: [0; 16],
+			F: [0xFE; 16],
 			
 			SDTR_base: 0,
 			SDTR_len: 0,
+			
+			PEBA_base: 0,
+			PLBA_base: 0,
 			
 			running: Arc::new(AtomicBool::new(false)),
 			cycles: 0,
 			
 			bus: bus,
-			channels: Vec::new()
-			
+			channels: Vec::new(),
+			ipl: Vec::new(),
+			icode: Vec::new()
 		};
 		
 		for _ in 0..16 {
 			result.channels.push(Channel::new(&result.bus));
 		}
+		for _ in 0..8 {
+			result.ipl.push(Arc::new(AtomicBool::new(false)));
+		}
+		for _ in 0..8 {
+			result.icode.push(Arc::new(AtomicU8::new(0)));
+		}
 		
 		result
+	}
+	
+	fn pl_set(&mut self, pl: u8, ssr7: u8, bus: &mut Bus) {
+		
+		let new_priority = pl & 0x7;
+		
+		let old_ps_base = self.S_base[PS];
+		let old_ps_limit = self.S_limit[PS];
+		
+		let old_ps_key = self.S_key[PS];
+		let old_ps_flags = self.S_flags[PS];
+		let old_sr8 = self.F[8];
+		let old_ps_selector = self.S_selector[PS];
+		let old_lba2 = (old_ps_key as u32) | (old_ps_flags as u32) << 8 | (old_sr8 as u32) << 16 | (old_ps_selector as u32) << 24;
+		
+		let old_pc = self.R[PC];
+		
+		// write out PLBA for target priority level
+		
+		let mut error = false;
+		loop {
+			let link_block_offset = self.PLBA_base + 16 * new_priority as u32;
+			
+			match bus.write_w(link_block_offset, old_ps_base) {
+				Err(_) => {
+					self.write_fault(0xFFFF, link_block_offset);
+					error = true;
+					break;
+				},
+				Ok(_) => { /* do nothing */ },
+			};
+			
+			match bus.write_w(link_block_offset + 4, old_ps_limit) {
+				Err(_) => {
+					self.write_fault(0xFFFF, link_block_offset + 4);
+					error = true;
+					break;
+				},
+				Ok(_) => { /* do nothing */ },
+			};
+			
+			match bus.write_w(link_block_offset + 8, old_lba2) {
+				Err(_) => {
+					self.write_fault(0xFFFF, link_block_offset + 8);
+					error = true;
+					break;
+				},
+				Ok(_) => { /* do nothing */ },
+			};
+			
+			match bus.write_w(link_block_offset + 12, old_pc) {
+				Err(_) => {
+					self.write_fault(0xFFFF, link_block_offset + 12);
+					error = true;
+					break;
+				},
+				Ok(_) => { /* do nothing */ },
+			};
+			
+			break;
+		}
+		
+		if error {
+			return;
+		}
+		
+		// read in PEBA for target priority level
+		
+		loop {
+			let entry_block_offset = self.PEBA_base + 16 * new_priority as u32;
+			
+			match bus.read_w(entry_block_offset) {
+				Err(_) => {
+					self.read_fault(0xFFFF, entry_block_offset);
+					error = true;
+					break;
+				},
+				Ok(x) => { self.S_base[PS] = x; },
+			};
+			
+			match bus.read_w(entry_block_offset + 4) {
+				Err(_) => {
+					self.read_fault(0xFFFF, entry_block_offset + 4);
+					error = true;
+					break;
+				},
+				Ok(x) => { self.S_limit[PS] = x; },
+			};
+			
+			match bus.read_w(entry_block_offset + 8) {
+				Err(_) => {
+					self.read_fault(0xFFFF, entry_block_offset + 8);
+					error = true;
+					break;
+				},
+				Ok(x) => {
+					self.S_key[PS] = (x & 0xFF) as u8;
+					self.S_flags[PS] = ((x & 0xFF00) >> 8) as u8;
+					self.F[8] = ((x & 0xFF0000) >> 16) as u8;
+					self.F[8] &= !(0xE);
+					self.F[8] |= new_priority << 1;
+					self.S_selector[PS] = ssr7;
+				},
+			};
+			
+			match bus.read_w(entry_block_offset + 12) {
+				Err(_) => {
+					self.read_fault(0xFFFF, entry_block_offset + 12);
+					error = true;
+					break;
+				},
+				Ok(x) => { self.R[PC] = x; },
+			};
+			
+			break;
+		}
+	}
+
+	fn pl_esc(&mut self, pl: u8, ssr7: u8, bus: &mut Bus) -> bool {
+		let new_priority = pl & 0x7;
+		let old_priority = (self.F[8] & 0xE) >> 1;
+		
+		if new_priority > old_priority {
+			self.pl_set(new_priority, ssr7, bus);
+			true
+		} else {
+			false
+		}
+	}
+	
+	fn pl_retn(&mut self, bus: &mut Bus) {
+		// restore old priority level		
+		let mut error = false;
+		loop {
+			let link_block_offset = self.PLBA_base + 16 * ((self.F[8] & 0xE) >> 1) as u32;
+			
+			match bus.read_w(link_block_offset) {
+				Err(_) => {
+					self.read_fault(0xFFFF, link_block_offset);
+					error = true;
+					break;
+				},
+				Ok(x) => { self.S_base[PS] = x; },
+			};
+			
+			match bus.read_w(link_block_offset + 4) {
+				Err(_) => {
+					self.read_fault(0xFFFF, link_block_offset + 4);
+					error = true;
+					break;
+				},
+				Ok(x) => { self.S_limit[PS] = x; },
+			};
+			
+			match bus.read_w(link_block_offset + 8) {
+				Err(_) => {
+					self.read_fault(0xFFFF, link_block_offset + 8);
+					error = true;
+					break;
+				},
+				Ok(x) => {
+					self.S_key[PS] = (x & 0xFF) as u8;
+					self.S_flags[PS] = ((x & 0xFF00) >> 8) as u8;
+					self.F[8] = ((x & 0xFF0000) >> 16) as u8;
+					self.S_selector[PS] = ((x & 0xFF000000) >> 24) as u8;
+				},
+			};
+			
+			match bus.read_w(link_block_offset + 12) {
+				Err(_) => {
+					self.read_fault(0xFFFF, link_block_offset + 12);
+					error = true;
+					break;
+				},
+				Ok(x) => { self.R[PC] = x; },
+			};
+			
+			break;
+		}
 	}
 	
 	pub fn run(cpu: Arc<Mutex<SeriesQ>>) {
@@ -430,13 +683,15 @@ impl SeriesQ {
 			
 			let mut our_bus = Arc::clone(&cpu.bus);
 			let mut held_bus = our_bus.lock().unwrap();
+			
 			println!("CPU START, {} devices attached to bus", held_bus.region.len());
 			cpu.running.store(true, Ordering::Relaxed);
 			while cpu.running.load(Ordering::Relaxed) {
 				// clear zero register
 				cpu.R[0] = 0;
 				
-				// TODO: service interrupts
+				// cpu.pl_set(3, &mut held_bus);
+				
 				
 				// instruction fetch
 				let mut iword0: u16 = 0;
@@ -447,21 +702,16 @@ impl SeriesQ {
 				if cpu.access_check(PS, addr, false, true) {
 					match held_bus.read_h_big(cpu.R[PC].wrapping_add(cpu.S_base[PS])) {
 						Err(_) => {
-							// TODO: handle read fault
-							println!("@{:08X}::{:08X} READ FAULT IFETCH", cpu.S_base[PS], cpu.R[PC]);
 							ifetch = false;
 							// for now
-							cpu.running.store(false, Ordering::Relaxed);
+							cpu.read_fault(0xFFFF, addr);
 						},
-						// TODO: increment PC after fetch as soon as we're done profiling performance
 						Ok(x) => { iword0 = x; cpu.R[PC] = cpu.R[PC].wrapping_add(2); },
 					};
 				} else {
-					// TODO: handle segmentation fault
-					println!("@{:08X}::{:08X} SEGMENTATION FAULT IFETCH", cpu.S_base[PS], cpu.R[PC]);
 					ifetch = false;
 					// for now
-					cpu.running.store(false, Ordering::Relaxed);
+					cpu.seg_fault(0xFFFF, addr);
 				}
 				
 				// TODO: fetch rest of instruction
@@ -471,25 +721,20 @@ impl SeriesQ {
 					if cpu.access_check(PS, addr, false, true) {
 						match held_bus.read_h_big(cpu.R[PC].wrapping_add(cpu.S_base[PS])) {
 							Err(_) => {
-								// TODO: handle read fault
-								println!("@{:08X}::{:08X} READ FAULT IFETCH", cpu.S_base[PS], cpu.R[PC]);
 								ifetch = false;
 								// for now
-								cpu.running.store(false, Ordering::Relaxed);
+								cpu.read_fault(0xFFFF, addr);
 							},
 							Ok(x) => { iword1 = x; cpu.R[PC] = cpu.R[PC].wrapping_add(2); },
 						};
 					} else {
-						// TODO: handle segmentation fault
-						println!("@{:08X}::{:08X} SEGMENTATION FAULT IFETCH", cpu.S_base[PS], cpu.R[PC]);
 						ifetch = false;
 						// for now
-						cpu.running.store(false, Ordering::Relaxed);
+						cpu.seg_fault(0xFFFF, addr);
 					}
 				}
 				
 				if ifetch && !skip {
-					// TODO: execute instructions
 					match (iword0 & 0xFF00) >> 8 {
 						
 						// RR
@@ -627,13 +872,13 @@ impl SeriesQ {
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
-						0b00011110 => { // ASLQ, arithmetic quick shift left
-							let (x, flags) = alu_sal(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 1, cpu.F[0]);
+						0b00011110 => { // SLQL, long quick shift left
+							let (x, flags) = alu_shl(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 16, cpu.F[0]);
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
-						0b00011111 => { // ASRQ, arithmetic quick shift right
-							let (x, flags) = alu_sar(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 1, cpu.F[0]);
+						0b00011111 => { // SRQL, long quick shift right
+							let (x, flags) = alu_shr(cpu.R[rr_reg_d(iword0)], rr_reg_r(iword0) as u32 + 16, cpu.F[0]);
 							cpu.R[rr_reg_d(iword0)] = x;
 							cpu.F[0] = flags;
 						},
@@ -675,14 +920,40 @@ impl SeriesQ {
 								cpu.SDTR_len = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
 								cpu.SDTR_base = cpu.R[rr_reg_d(iword0)];
 							}
+							
+							let mut ok = true;
+							
+							// set PEBA
+							let addr = cpu.SDTR_base;
+							match held_bus.read_w(addr) {
+								Err(_) => {
+									cpu.read_fault(iword0, addr);
+									ok = false;
+								},
+								Ok(x) => { cpu.PEBA_base = x; },
+							};
+							
+							// set PLBA
+							if ok {
+								let addr = cpu.SDTR_base + 12;
+								match held_bus.read_w(addr) {
+									Err(_) => {
+										cpu.read_fault(iword0, addr);
+										ok = false;
+									},
+									Ok(x) => { cpu.PLBA_base = x; },
+								};
+							}
 						},
 						
 						0b00100110 => { // LSEL, load segment selector
 							cpu.R[rr_reg_d(iword0)] = cpu.S_selector[rr_reg_r(iword0)] as u32;
 						}
 						0b00100111 => { // SSEL, set segment selector
-							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) || ((cpu.R[rr_reg_r(iword0)] & 0xFF) as u8) > cpu.SDTR_len {
+							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) {
 								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
+							} else if ((cpu.R[rr_reg_r(iword0)] & 0xFF) as u8) > cpu.SDTR_len {
+								cpu.app_fault(iword0, OUT_OF_BOUNDS as u32);
 							} else {
 								cpu.S_selector[rr_reg_d(iword0)] = (cpu.R[rr_reg_r(iword0)] & 0xFF) as u8;
 								
@@ -761,8 +1032,10 @@ impl SeriesQ {
 							}
 						}
 						0b00101011 => { // SSELHC, set segment selector
-							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) || ((rr_reg_r(iword0) & 0xFF) as u8) > cpu.SDTR_len {
+							if (cpu.F[8] & 0b00000001 != 0 && rr_reg_d(iword0) >= 8) {
 								cpu.app_fault(iword0, SUPERVISOR_ACCESS as u32);
+							} else if ((rr_reg_r(iword0) & 0xFF) as u8) > cpu.SDTR_len {
+								cpu.app_fault(iword0, OUT_OF_BOUNDS as u32);
 							} else {
 								cpu.S_selector[rr_reg_d(iword0)] = ((rr_reg_r(iword0) as u32) & 0xFF) as u8;
 								
@@ -1159,16 +1432,26 @@ impl SeriesQ {
 						},
 						
 						_ => {
-							// TODO: handle illegal instruction
-							println!("@{:08X}::{:08X} ILLEGAL INSTRUCTION", cpu.S_base[PS], cpu.R[PC]);
-							cpu.running.store(false, Ordering::Relaxed);
+							// handle illegal instruction
+							cpu.app_fault(0xFFFF, ILLEGAL_INSTRUCTION as u32);
 						},
 					};
 				} else if skip {
 					skip = false;
 				}
 				
-				// TODO: service DMA
+				// service interrupts
+				
+				let mut new_pl = 0;
+				for (index, state) in cpu.ipl.iter().enumerate() {
+					if state.load(Ordering::Relaxed) && index > new_pl {
+						new_pl = index;
+					}
+				}
+				let new_code = cpu.icode[new_pl].load(Ordering::Relaxed);
+				cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus);
+				
+				// service DMA
 				
 				for c in &cpu.channels {
 					if c.check_pending() {
@@ -1177,7 +1460,6 @@ impl SeriesQ {
 						held_bus = our_bus.lock().unwrap();
 					}
 				}
-				
 				cpu.cycles = cpu.cycles.wrapping_add(1);
 			}
 			println!("@{:08X}::{:08X} CPU STOP - {} cycles", cpu.S_base[PS], cpu.R[PC], cpu.cycles);
