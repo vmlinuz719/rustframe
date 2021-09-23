@@ -7,71 +7,6 @@ use crate::bus::Memory32;
 use crate::cpu::{SeriesQ, SQAddr};
 
 fn main() {
-	/* let mem = Arc::new(Mutex::new(vec![0 as u8; 8192]));
-	let mem2 = Arc::new(Mutex::new(vec![0 as u8; 8192]));
-	let mut x = mem2.lock().unwrap();
-	x.write_w(0, 8192);
-	drop(x);
-	
-	let mem_clone = Arc::clone(&mem);
-	let mem2_clone = Arc::clone(&mem2);
-	
-	let mut b = bus::Bus::new();
-	b.attach(0, 8192, mem_clone);
-	b.attach(8192, 8192, mem2_clone);
-	
-	let bus = Arc::new(Mutex::new(b));
-	let channels = [bus::Channel::new(&bus), bus::Channel::new(&bus),
-					bus::Channel::new(&bus), bus::Channel::new(&bus),
-					bus::Channel::new(&bus), bus::Channel::new(&bus),
-					bus::Channel::new(&bus), bus::Channel::new(&bus)];
-	let ch0 = bus::Channel::clone(&channels[0]);
-	let ch1 = bus::Channel::clone(&channels[1]);
-	
-	// simulate device on channel 0
-	thread::spawn(move || {
-		loop {
-			thread::sleep(time::Duration::from_millis(1000));
-			ch0.in_channel(|bus| {
-				bus.read_b(0xDEADBEEF);
-			});
-			println!("Bus call successful");
-		}
-	});
-	
-	// simulate device on channel 1
-	thread::spawn(move || {
-		loop {
-			thread::sleep(time::Duration::from_millis(2000));
-			ch1.in_channel(|bus| {
-				bus.read_b(0x0C07FEFE);
-			});
-			println!("Bus call successful");
-		}
-	});
-	
-	// simulate bus host
-	let mut held_bus = bus.lock().unwrap();
-	let mut cycles = 0;
-	
-	loop {
-		cycles += 1;
-		let x = held_bus.read_w(0).unwrap();
-		let y = held_bus.read_w(8192).unwrap();
-		
-		for n in 0..8 {
-			if channels[n].check_pending() {
-				println!("CPU: Got BRQ on channel {0}, asserting BGR - \
-					BEGIN DMA after {1} CPU cycles ({2}, {3})", n, cycles, x, y);
-				cycles = 
-				
-				drop(held_bus);
-				channels[n].open();
-				held_bus = bus.lock().unwrap();
-			}
-		}
-	} */
-	
 	let mem = Arc::new(Mutex::new(vec![0 as u8; 65536]));
 	let mem_clone = Arc::clone(&mem);
 	let mut b = bus::Bus::new();
@@ -105,14 +40,34 @@ fn main() {
 	bus3.write_b(0xF20, 0xEB);
 	bus3.write_b(0xF21, 0x00);
 	
+	bus3.write_w(0xF22, 0x00000000);
+	bus3.write_w(0xF26, 0x00010000);
+	bus3.write_b(0xF2A, 0xEB);
+	bus3.write_b(0xF2B, 0x01);
+	
+	// user program segment
+	bus3.write_w(0xF2C, 0x00004000);
+	bus3.write_w(0xF30, 0x00006FFF);
+	bus3.write_b(0xF34, 0x0E);
+	bus3.write_b(0xF35, 0xE0);
+	
+	// user exit trampoline
+	bus3.write_w(0xC000, 0x00002000);
+	bus3.write_w(0xC004, 0x00002FFF);
+	bus3.write_b(0xC008, 0xFF);
+	bus3.write_b(0xC009, 0x00);
+	bus3.write_b(0xC00A, 0x7E);
+	bus3.write_b(0xC00B, 0x01);
+	bus3.write_w(0xC00C, 0x00000000);
+	
 	// test LBA entry
-	bus3.write_w(0xC070, 0xDEADBEEF);
-	bus3.write_w(0xC074, 0xDEADBEEF);
-	bus3.write_b(0xC078, 0xFA);
+	bus3.write_w(0xC070, 0x00004000);
+	bus3.write_w(0xC074, 0x00006FFF);
+	bus3.write_b(0xC078, 0x0E);
 	bus3.write_b(0xC079, 0xE0);
-	bus3.write_b(0xC07A, 0x70);
-	bus3.write_b(0xC07B, 0xFF);
-	bus3.write_w(0xC07C, 0x1C07FEFE);
+	bus3.write_b(0xC07A, 0x71);
+	bus3.write_b(0xC07B, 0x04);
+	bus3.write_w(0xC07C, 0x00000000);
 	
 	// test EBA entry
 	bus3.write_w(0xC170, 0x00002000);
@@ -123,21 +78,28 @@ fn main() {
 	bus3.write_b(0xC17B, 0x00);
 	bus3.write_w(0xC17C, 0x00000000);
 	
-	bus3.write_w(0xF24, 0x00000000);
-	bus3.write_w(0xF28, 0x00010000);
-	bus3.write_b(0xF2C, 0xEB);
-	bus3.write_b(0xF30, 0x01);
-	
 	bus3.write_h(0x1000, 0x1F_01);	// LFI 1, 15
 	bus3.write_h(0x1002, 0x17_1C);  // SLFI 1, 7
 	bus3.write_h(0x1004, 0x24_01);	// LFI 2, 4
 	bus3.write_h(0x1006, 0x12_25);	// SSBA 1, 2
 	bus3.write_h(0x1008, 0x72_2B);	// SLSFI 7, 2
 	bus3.write_h(0x100A, 0x03_2B);	// SLSFI 0, 3
-	bus3.write_h(0x100A, 0x00_30);	// PLR
+	bus3.write_h(0x100C, 0x3E_01);	// LFI 3, 14
+	bus3.write_h(0x100E, 0x03_29);	// SMPK 0, 3
+	bus3.write_h(0x1010, 0x00_30);	// PLR
 	
-	bus3.write_h(0x2000, 0x31_0C);	// AFI 3, 1
-	bus3.write_h(0x2002, 0x00_30);	// PLR
+	bus3.write_h(0x2000, 0xFF_FF);	// HALT
+	
+	bus3.write_w(0x4000, 0x23_71_50_61);	// LA 5, PS: 0, X'123'
+	bus3.write_h(0x4004, 0x54_1E);			// SLFIL 5, 4
+	bus3.write_h(0x4006, 0x00_00);			// NOP
+	bus3.write_w(0x4008, 0x56_74_60_61);	// LA 6, PS: 0, X'456'
+	bus3.write_h(0x400C, 0x67_1C);			// SLFI 6, 7
+	bus3.write_h(0x400E, 0x56_11);			// O 5, 6
+	bus3.write_w(0x4010, 0x78_00_60_41);	// LA 6, 0: 0, 0, X'78'
+	bus3.write_h(0x4014, 0x56_06);			// BIN 5, 6
+	bus3.write_h(0x4016, 0x60_00);			// MV 6, 0
+	bus3.write_h(0x4018, 0x00_30);			// PLR
 	
 	drop(bus3);
 	
