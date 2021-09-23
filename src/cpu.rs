@@ -410,7 +410,6 @@ impl SeriesQ {
 			// we are in supervisor state
 			self.sys_fault(iword0, error_code);
 		} else {
-			// TODO: priority level nonsense
 			// println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
 			
 			let new_pl = (self.F[8] & 0x70) >> 4;
@@ -418,7 +417,6 @@ impl SeriesQ {
 			self.S_selector[PS] = (error_code & 0xFF) as u8;
 			self.F[10] = (iword0 & 0xFF) as u8;
 			self.F[11] = ((iword0 & 0xFF00) >> 8) as u8;
-			self.running.store(false, Ordering::Relaxed);
 			
 			if (self.F[8] & 0xE) >> 1 <= new_pl {
 				self.faultpl[7].store(true, Ordering::Relaxed);
@@ -1444,6 +1442,10 @@ impl SeriesQ {
 							
 							cpu.copy_segment(PS, rm_seg_s(iword1));
 							cpu.R[PC] = cpu.gen_offset_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
+						},
+						
+						0xFF => {
+							cpu.running.store(false, Ordering::Relaxed);
 						},
 						
 						_ => {
