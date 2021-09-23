@@ -66,6 +66,9 @@ pub struct SeriesQ {
 	pub channels: Vec<Channel<Bus>>,
 	pub ipl: Vec<Arc<AtomicBool>>,
 	pub icode: Vec<Arc<AtomicU8>>,
+	
+	pub faultpl: Vec<Arc<AtomicBool>>,
+	pub faultcode: Vec<Arc<AtomicU8>>,
 }
 
 fn sign_u32(x: u32) -> bool {
@@ -408,7 +411,7 @@ impl SeriesQ {
 			self.sys_fault(iword0, error_code);
 		} else {
 			// TODO: priority level nonsense
-			println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
+			// println!("@{:08X}::{:08X} 0x{:04X} APPLICATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
 			
 			let new_pl = (self.F[8] & 0x70) >> 4;
 			
@@ -417,16 +420,17 @@ impl SeriesQ {
 			self.F[11] = ((iword0 & 0xFF00) >> 8) as u8;
 			self.running.store(false, Ordering::Relaxed);
 			
-			if (self.F[8] & 0xE) >> 1 == 7 {
-				self.running.store(false, Ordering::Relaxed);
+			if (self.F[8] & 0xE) >> 1 <= new_pl {
+				self.faultpl[7].store(true, Ordering::Relaxed);
+				self.faultcode[7].store((error_code & 0xFF) as u8, Ordering::Relaxed);
 			} else {
-				self.ipl[new_pl as usize].store(true, Ordering::Relaxed);
-				self.icode[new_pl as usize].store((error_code & 0xFF) as u8, Ordering::Relaxed);
+				self.faultpl[new_pl as usize].store(true, Ordering::Relaxed);
+				self.faultcode[new_pl as usize].store((error_code & 0xFF) as u8, Ordering::Relaxed);
 			}
 		}
 	}
 	fn sys_fault(&mut self, iword0: u16, error_code: u32) {
-		println!("@{:08X}::{:08X} 0x{:04X} SYSTEM FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
+		// println!("@{:08X}::{:08X} 0x{:04X} SYSTEM FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, error_code);
 		self.F[10] = (iword0 & 0xFF) as u8;
 		self.F[11] = ((iword0 & 0xFF00) >> 8) as u8;
 		
@@ -434,8 +438,8 @@ impl SeriesQ {
 		if (self.F[8] & 0xE) >> 1 == 7 {
 			self.running.store(false, Ordering::Relaxed);
 		} else {
-			self.ipl[7].store(true, Ordering::Relaxed);
-			self.icode[7].store((error_code & 0xFF) as u8, Ordering::Relaxed);
+			self.faultpl[7].store(true, Ordering::Relaxed);
+			self.faultcode[7].store((error_code & 0xFF) as u8, Ordering::Relaxed);
 		}
 	}
 	
@@ -480,7 +484,10 @@ impl SeriesQ {
 			bus: bus,
 			channels: Vec::new(),
 			ipl: Vec::new(),
-			icode: Vec::new()
+			icode: Vec::new(),
+			
+			faultpl: Vec::new(),
+			faultcode: Vec::new()
 		};
 		
 		for _ in 0..16 {
@@ -488,9 +495,11 @@ impl SeriesQ {
 		}
 		for _ in 0..8 {
 			result.ipl.push(Arc::new(AtomicBool::new(false)));
+			result.faultpl.push(Arc::new(AtomicBool::new(false)));
 		}
 		for _ in 0..8 {
 			result.icode.push(Arc::new(AtomicU8::new(0)));
+			result.faultcode.push(Arc::new(AtomicU8::new(0)));
 		}
 		
 		result
@@ -1048,6 +1057,7 @@ impl SeriesQ {
 									Err(_) => {
 										cpu.read_fault(iword0, addr);
 										ok = false;
+										println!("Error");
 									},
 									Ok(x) => { cpu.S_base[rr_reg_d(iword0)] = x; },
 								};
@@ -1090,6 +1100,11 @@ impl SeriesQ {
 								
 							}
 						}
+						
+						0b00110000 => { // PLR, priority level return
+							cpu.pl_retn(&mut held_bus);
+							// cpu.running.store(false, Ordering::Relaxed);
+						},
 						
 						0b00111110 => { // IF, conditionally execute next instruction
 							let mask = (iword0 & 0xFF) as u8;
@@ -1443,14 +1458,29 @@ impl SeriesQ {
 				// service interrupts
 				
 				let mut new_pl = 0;
-				for (index, state) in cpu.ipl.iter().enumerate() {
+				for (index, state) in cpu.faultpl.iter().enumerate() {
 					if state.load(Ordering::Relaxed) && index > new_pl {
 						new_pl = index;
 					}
 				}
-				let new_code = cpu.icode[new_pl].load(Ordering::Relaxed);
-				cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus);
-				
+				let new_code = cpu.faultcode[new_pl].load(Ordering::Relaxed);
+				if cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus) {
+					//println!("Interrupt {}", new_pl);
+					cpu.faultpl[new_pl].store(false, Ordering::Relaxed);
+				} else {
+					new_pl = 0;
+					for (index, state) in cpu.ipl.iter().enumerate() {
+						if state.load(Ordering::Relaxed) && index > new_pl {
+							new_pl = index;
+						}
+					}
+					let new_code = cpu.icode[new_pl].load(Ordering::Relaxed);
+					if cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus) {
+						//println!("Interrupt {}", new_pl);
+						
+					}
+				}
+					
 				// service DMA
 				
 				for c in &cpu.channels {
