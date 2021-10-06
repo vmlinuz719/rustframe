@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, Condvar};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum BusError {
-	AccessViolation,
 	AlignmentCheck,
 	InvalidAddress
 }
