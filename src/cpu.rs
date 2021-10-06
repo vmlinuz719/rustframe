@@ -15,6 +15,10 @@ pub const ILLEGAL_INSTRUCTION: i32 = -3;
 pub const SEGMENTATION_FAULT: i32 = -4;
 pub const READ_FAULT: i32 = -5;
 pub const WRITE_FAULT: i32 = -6;
+pub const READ_ALIGN: i32 = -7;
+pub const READ_ADDR: i32 = -8;
+pub const WRITE_ALIGN: i32 = -9;
+pub const WRITE_ADDR: i32 = -10;
 
 // functions for instruction decode
 fn rr_reg_d(iword: u16) -> usize {
@@ -60,6 +64,7 @@ pub struct SeriesQ {
 	pub PLBA_base: u32,
 	
 	pub running: Arc<AtomicBool>,
+	pub waiting: Arc<AtomicBool>,
 	pub cycles: u64,
 	
 	pub bus: Arc<Mutex<Bus>>,
@@ -384,19 +389,29 @@ impl SeriesQ {
 		}
 	}
 	
-	fn read_fault(&mut self, iword0: u16, addr: u32) {
+	fn read_fault(&mut self, iword0: u16, addr: u32, err: BusError) {
 		self.F[12] = (addr & 0xFF) as u8;
 		self.F[13] = ((addr & 0xFF00) >> 8) as u8;
 		self.F[14] = ((addr & 0xFF0000) >> 16) as u8;
 		self.F[15] = ((addr & 0xFF000000) >> 24) as u8;
-		self.app_fault(iword0, READ_FAULT as u32);
+		
+		match err {
+			BusError::AlignmentCheck => self.app_fault(iword0, READ_ALIGN as u32),
+			BusError::InvalidAddress => self.app_fault(iword0, READ_ADDR as u32),
+			_ => self.app_fault(iword0, READ_FAULT as u32),
+		}
 	}
-	fn write_fault(&mut self, iword0: u16, addr: u32) {
+	fn write_fault(&mut self, iword0: u16, addr: u32, err: BusError) {
 		self.F[12] = (addr & 0xFF) as u8;
 		self.F[13] = ((addr & 0xFF00) >> 8) as u8;
 		self.F[14] = ((addr & 0xFF0000) >> 16) as u8;
 		self.F[15] = ((addr & 0xFF000000) >> 24) as u8;
-		self.app_fault(iword0, WRITE_FAULT as u32);
+		
+		match err {
+			BusError::AlignmentCheck => self.app_fault(iword0, WRITE_ALIGN as u32),
+			BusError::InvalidAddress => self.app_fault(iword0, WRITE_ADDR as u32),
+			_ => self.app_fault(iword0, WRITE_FAULT as u32),
+		}
 	}
 	fn seg_fault(&mut self, iword0: u16, addr: u32) {
 		self.F[12] = (addr & 0xFF) as u8;
@@ -414,7 +429,7 @@ impl SeriesQ {
 			
 			let new_pl = (self.F[8] & 0x70) >> 4;
 			
-			self.S_selector[PS] = (error_code & 0xFF) as u8;
+			// self.S_selector[PS] = (error_code & 0xFF) as u8;
 			self.F[10] = (iword0 & 0xFF) as u8;
 			self.F[11] = ((iword0 & 0xFF00) >> 8) as u8;
 			
@@ -477,6 +492,7 @@ impl SeriesQ {
 			PLBA_base: 0,
 			
 			running: Arc::new(AtomicBool::new(false)),
+			waiting: Arc::new(AtomicBool::new(false)),
 			cycles: 0,
 			
 			bus: bus,
@@ -499,7 +515,7 @@ impl SeriesQ {
 			result.icode.push(Arc::new(AtomicU8::new(0)));
 			result.faultcode.push(Arc::new(AtomicU8::new(0)));
 		}
-		
+		result.R[15] = 0x1000;
 		result
 	}
 	
@@ -525,8 +541,8 @@ impl SeriesQ {
 			let link_block_offset = self.PLBA_base + 16 * new_priority as u32;
 			
 			match bus.write_w(link_block_offset, old_ps_base) {
-				Err(_) => {
-					self.write_fault(0xFFFF, link_block_offset);
+				Err(e) => {
+					self.write_fault(0xFFFF, link_block_offset, e);
 					error = true;
 					break;
 				},
@@ -534,8 +550,8 @@ impl SeriesQ {
 			};
 			
 			match bus.write_w(link_block_offset + 4, old_ps_limit) {
-				Err(_) => {
-					self.write_fault(0xFFFF, link_block_offset + 4);
+				Err(e) => {
+					self.write_fault(0xFFFF, link_block_offset + 4, e);
 					error = true;
 					break;
 				},
@@ -543,17 +559,17 @@ impl SeriesQ {
 			};
 			
 			match bus.write_w(link_block_offset + 8, old_lba2) {
-				Err(_) => {
-					self.write_fault(0xFFFF, link_block_offset + 8);
+				Err(e) => {
+					self.write_fault(0xFFFF, link_block_offset + 8, e);
 					error = true;
 					break;
 				},
-				Ok(_) => { /* do nothing */ },
+				Ok(_) => {  },
 			};
 			
 			match bus.write_w(link_block_offset + 12, old_pc) {
-				Err(_) => {
-					self.write_fault(0xFFFF, link_block_offset + 12);
+				Err(e) => {
+					self.write_fault(0xFFFF, link_block_offset + 12, e);
 					error = true;
 					break;
 				},
@@ -573,8 +589,8 @@ impl SeriesQ {
 			let entry_block_offset = self.PEBA_base + 16 * new_priority as u32;
 			
 			match bus.read_w(entry_block_offset) {
-				Err(_) => {
-					self.read_fault(0xFFFF, entry_block_offset);
+				Err(e) => {
+					self.read_fault(0xFFFF, entry_block_offset, e);
 					error = true;
 					break;
 				},
@@ -582,8 +598,8 @@ impl SeriesQ {
 			};
 			
 			match bus.read_w(entry_block_offset + 4) {
-				Err(_) => {
-					self.read_fault(0xFFFF, entry_block_offset + 4);
+				Err(e) => {
+					self.read_fault(0xFFFF, entry_block_offset + 4, e);
 					error = true;
 					break;
 				},
@@ -591,8 +607,8 @@ impl SeriesQ {
 			};
 			
 			match bus.read_w(entry_block_offset + 8) {
-				Err(_) => {
-					self.read_fault(0xFFFF, entry_block_offset + 8);
+				Err(e) => {
+					self.read_fault(0xFFFF, entry_block_offset + 8, e);
 					error = true;
 					break;
 				},
@@ -607,8 +623,8 @@ impl SeriesQ {
 			};
 			
 			match bus.read_w(entry_block_offset + 12) {
-				Err(_) => {
-					self.read_fault(0xFFFF, entry_block_offset + 12);
+				Err(e) => {
+					self.read_fault(0xFFFF, entry_block_offset + 12, e);
 					error = true;
 					break;
 				},
@@ -638,8 +654,8 @@ impl SeriesQ {
 			let link_block_offset = self.PLBA_base + 16 * ((self.F[8] & 0xE) >> 1) as u32;
 			
 			match bus.read_w(link_block_offset) {
-				Err(_) => {
-					self.read_fault(0xFFFF, link_block_offset);
+				Err(e) => {
+					self.read_fault(0xFFFF, link_block_offset, e);
 					error = true;
 					break;
 				},
@@ -647,8 +663,8 @@ impl SeriesQ {
 			};
 			
 			match bus.read_w(link_block_offset + 4) {
-				Err(_) => {
-					self.read_fault(0xFFFF, link_block_offset + 4);
+				Err(e) => {
+					self.read_fault(0xFFFF, link_block_offset + 4, e);
 					error = true;
 					break;
 				},
@@ -656,8 +672,8 @@ impl SeriesQ {
 			};
 			
 			match bus.read_w(link_block_offset + 8) {
-				Err(_) => {
-					self.read_fault(0xFFFF, link_block_offset + 8);
+				Err(e) => {
+					self.read_fault(0xFFFF, link_block_offset + 8, e);
 					error = true;
 					break;
 				},
@@ -670,8 +686,8 @@ impl SeriesQ {
 			};
 			
 			match bus.read_w(link_block_offset + 12) {
-				Err(_) => {
-					self.read_fault(0xFFFF, link_block_offset + 12);
+				Err(e) => {
+					self.read_fault(0xFFFF, link_block_offset + 12, e);
 					error = true;
 					break;
 				},
@@ -697,8 +713,11 @@ impl SeriesQ {
 				// clear zero register
 				cpu.R[0] = 0;
 				
+				// println!("ssr7 0x{:02X}", cpu.S_selector[PS]);
+				
 				// cpu.pl_set(3, &mut held_bus);
 				
+				if !(cpu.waiting.load(Ordering::Relaxed)) {
 				
 				// instruction fetch
 				let mut iword0: u16 = 0;
@@ -708,10 +727,10 @@ impl SeriesQ {
 				let addr = cpu.R[PC].wrapping_add(cpu.S_base[PS]);
 				if cpu.access_check(PS, addr, false, true) {
 					match held_bus.read_h_big(cpu.R[PC].wrapping_add(cpu.S_base[PS])) {
-						Err(_) => {
+						Err(e) => {
 							ifetch = false;
 							// for now
-							cpu.read_fault(0xFFFF, addr);
+							cpu.read_fault(0xFFFF, addr, e);
 						},
 						Ok(x) => { iword0 = x; cpu.R[PC] = cpu.R[PC].wrapping_add(2); },
 					};
@@ -727,10 +746,10 @@ impl SeriesQ {
 					let addr = cpu.R[PC].wrapping_add(cpu.S_base[PS]);
 					if cpu.access_check(PS, addr, false, true) {
 						match held_bus.read_h_big(cpu.R[PC].wrapping_add(cpu.S_base[PS])) {
-							Err(_) => {
+							Err(e) => {
 								ifetch = false;
 								// for now
-								cpu.read_fault(0xFFFF, addr);
+								cpu.read_fault(0xFFFF, addr, e);
 							},
 							Ok(x) => { iword1 = x; cpu.R[PC] = cpu.R[PC].wrapping_add(2); },
 						};
@@ -933,8 +952,8 @@ impl SeriesQ {
 							// set PEBA
 							let addr = cpu.SDTR_base;
 							match held_bus.read_w(addr) {
-								Err(_) => {
-									cpu.read_fault(iword0, addr);
+								Err(e) => {
+									cpu.read_fault(iword0, addr, e);
 									ok = false;
 								},
 								Ok(x) => { cpu.PEBA_base = x; },
@@ -944,8 +963,8 @@ impl SeriesQ {
 							if ok {
 								let addr = cpu.SDTR_base + 12;
 								match held_bus.read_w(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 										ok = false;
 									},
 									Ok(x) => { cpu.PLBA_base = x; },
@@ -970,8 +989,8 @@ impl SeriesQ {
 								// read S_base
 								let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF);
 								match held_bus.read_w(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 										ok = false;
 									},
 									Ok(x) => { cpu.S_base[rr_reg_d(iword0)] = x; },
@@ -981,8 +1000,8 @@ impl SeriesQ {
 									// read S_limit
 									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 4;
 									match held_bus.read_w(addr) {
-										Err(_) => {
-											cpu.read_fault(iword0, addr);
+										Err(e) => {
+											cpu.read_fault(iword0, addr, e);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_limit[rr_reg_d(iword0)] = x; },
@@ -993,8 +1012,8 @@ impl SeriesQ {
 									// read S_key
 									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 8;
 									match held_bus.read_b(addr) {
-										Err(_) => {
-											cpu.read_fault(iword0, addr);
+										Err(e) => {
+											cpu.read_fault(iword0, addr, e);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_key[rr_reg_d(iword0)] = x; },
@@ -1005,8 +1024,8 @@ impl SeriesQ {
 									// read S_flags
 									let addr = cpu.SDTR_base + 12 * (cpu.R[rr_reg_r(iword0)] & 0xFF) + 9;
 									match held_bus.read_b(addr) {
-										Err(_) => {
-											cpu.read_fault(iword0, addr);
+										Err(e) => {
+											cpu.read_fault(iword0, addr, e);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_flags[rr_reg_d(iword0)] = x; },
@@ -1052,10 +1071,10 @@ impl SeriesQ {
 								// read S_base
 								let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF);
 								match held_bus.read_w(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 										ok = false;
-										println!("Error");
+										// println!("Error");
 									},
 									Ok(x) => { cpu.S_base[rr_reg_d(iword0)] = x; },
 								};
@@ -1064,8 +1083,8 @@ impl SeriesQ {
 									// read S_limit
 									let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF) + 4;
 									match held_bus.read_w(addr) {
-										Err(_) => {
-											cpu.read_fault(iword0, addr);
+										Err(e) => {
+											cpu.read_fault(iword0, addr, e);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_limit[rr_reg_d(iword0)] = x; },
@@ -1076,8 +1095,8 @@ impl SeriesQ {
 									// read S_key
 									let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF) + 8;
 									match held_bus.read_b(addr) {
-										Err(_) => {
-											cpu.read_fault(iword0, addr);
+										Err(e) => {
+											cpu.read_fault(iword0, addr, e);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_key[rr_reg_d(iword0)] = x; },
@@ -1088,8 +1107,8 @@ impl SeriesQ {
 									// read S_flags
 									let addr = cpu.SDTR_base + 12 * ((rr_reg_r(iword0) as u32) & 0xFF) + 9;
 									match held_bus.read_b(addr) {
-										Err(_) => {
-											cpu.read_fault(iword0, addr);
+										Err(e) => {
+											cpu.read_fault(iword0, addr, e);
 											ok = false;
 										},
 										Ok(x) => { cpu.S_flags[rr_reg_d(iword0)] = x; },
@@ -1100,8 +1119,16 @@ impl SeriesQ {
 						}
 						
 						0b00110000 => { // PLR, priority level return
+							// println!("got 0x{:02X}", cpu.S_selector[PS]);
 							cpu.pl_retn(&mut held_bus);
 							// cpu.running.store(false, Ordering::Relaxed);
+							// println!("now 0x{:02X}", cpu.S_selector[PS]);
+						},
+						0b00110001 => { // SVC, fault
+							// println!("got 0x{:02X}", cpu.S_selector[PS]);
+							cpu.app_fault(0b00110001, (iword0 & 0xFF) as u32);
+							// cpu.running.store(false, Ordering::Relaxed);
+							// println!("now 0x{:02X}", cpu.S_selector[PS]);
 						},
 						
 						0b00111110 => { // IF, conditionally execute next instruction
@@ -1122,8 +1149,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_w(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x; },
 								};
@@ -1139,8 +1166,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
@@ -1152,8 +1179,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
@@ -1166,8 +1193,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -1184,8 +1211,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -1203,8 +1230,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFFFF00) | (x as u32);
@@ -1218,8 +1245,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFF0000) | (x as u32);
@@ -1234,8 +1261,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_w(addr, cpu.R[rr_reg_d(iword0)]) {
-									Err(_) => {
-										cpu.write_fault(iword0, addr);
+									Err(e) => {
+										cpu.write_fault(iword0, addr, e);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
@@ -1247,8 +1274,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_b(addr, (cpu.R[rr_reg_d(iword0)] & 0xFF) as u8) {
-									Err(_) => {
-										cpu.write_fault(iword0, addr);
+									Err(e) => {
+										cpu.write_fault(iword0, addr, e);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
@@ -1260,8 +1287,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_h(addr, (cpu.R[rr_reg_d(iword0)] & 0xFFFF) as u16) {
-									Err(_) => {
-										cpu.write_fault(iword0, addr);
+									Err(e) => {
+										cpu.write_fault(iword0, addr, e);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
@@ -1283,13 +1310,12 @@ impl SeriesQ {
 						// RM
 						0b01100000 => { // RM L, load word
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
-							println!("{:08X}", addr);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_w(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
-									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x;},
+									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x; },
 								};
 							} else {
 								cpu.seg_fault(iword0, addr);
@@ -1303,8 +1329,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
@@ -1316,8 +1342,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => { cpu.R[rr_reg_d(iword0)] = x as u32; },
 								};
@@ -1330,8 +1356,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -1348,8 +1374,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = x as u32;
@@ -1367,8 +1393,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_b(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFFFF00) | (x as u32);
@@ -1382,8 +1408,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, false, false) {
 								match held_bus.read_h(addr) {
-									Err(_) => {
-										cpu.read_fault(iword0, addr);
+									Err(e) => {
+										cpu.read_fault(iword0, addr, e);
 									},
 									Ok(x) => {
 										cpu.R[rr_reg_d(iword0)] = (cpu.R[rr_reg_d(iword0)] & 0xFFFF0000) | (x as u32);
@@ -1396,10 +1422,11 @@ impl SeriesQ {
 						
 						0b01101000 => { // RM ST, store word
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
+							// println!("{:08X}", addr);
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_w(addr, cpu.R[rr_reg_d(iword0)]) {
-									Err(_) => {
-										cpu.write_fault(iword0, addr);
+									Err(e) => {
+										cpu.write_fault(iword0, addr, e);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
@@ -1411,8 +1438,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_b(addr, (cpu.R[rr_reg_d(iword0)] & 0xFF) as u8) {
-									Err(_) => {
-										cpu.write_fault(iword0, addr);
+									Err(e) => {
+										cpu.write_fault(iword0, addr, e);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
@@ -1424,8 +1451,8 @@ impl SeriesQ {
 							let addr = cpu.gen_addr_rm(rm_seg_s(iword1), rr_reg_r(iword0), iword1);
 							if cpu.access_check(rm_seg_s(iword1), addr, true, false) {
 								match held_bus.write_h(addr, (cpu.R[rr_reg_d(iword0)] & 0xFFFF) as u16) {
-									Err(_) => {
-										cpu.write_fault(iword0, addr);
+									Err(e) => {
+										cpu.write_fault(iword0, addr, e);
 									},
 									Ok(_) => { /* do nothing */ },
 								};
@@ -1457,6 +1484,8 @@ impl SeriesQ {
 					skip = false;
 				}
 				
+				}
+				
 				// service interrupts
 				
 				let mut new_pl = 0;
@@ -1469,6 +1498,7 @@ impl SeriesQ {
 				if cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus) {
 					//println!("Interrupt {}", new_pl);
 					cpu.faultpl[new_pl].store(false, Ordering::Relaxed);
+					cpu.waiting.store(false, Ordering::Relaxed);
 				} else {
 					new_pl = 0;
 					for (index, state) in cpu.ipl.iter().enumerate() {
@@ -1479,7 +1509,7 @@ impl SeriesQ {
 					let new_code = cpu.icode[new_pl].load(Ordering::Relaxed);
 					if cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus) {
 						//println!("Interrupt {}", new_pl);
-						
+						cpu.waiting.store(false, Ordering::Relaxed);
 					}
 				}
 					
