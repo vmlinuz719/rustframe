@@ -419,6 +419,7 @@ impl SeriesQ {
 		self.F[14] = ((addr & 0xFF0000) >> 16) as u8;
 		self.F[15] = ((addr & 0xFF000000) >> 24) as u8;
 		self.app_fault(iword0, SEGMENTATION_FAULT as u32);
+		println!("@{:08X}::{:08X} 0x{:04X} SEGMENTATION FAULT 0x{:08X}", self.S_base[PS], self.R[PC], iword0, addr);
 	}
 	fn app_fault(&mut self, iword0: u16, error_code: u32) {
 		if self.F[8] & 1 == 0 {
@@ -1174,6 +1175,7 @@ impl SeriesQ {
 							} else {
 								cpu.seg_fault(iword0, addr);
 							}
+							// println!("BTR");
 						},
 						0b01000011 => { // RMX HTR, half truncate
 							let addr = cpu.gen_addr_rmx(rm_seg_s(iword1), rr_reg_r(iword0), rmx_reg_x(iword1), rmx_idx_i(iword1));
@@ -1507,7 +1509,7 @@ impl SeriesQ {
 						}
 					}
 					let new_code = cpu.icode[new_pl].load(Ordering::Relaxed);
-					if cpu.pl_esc((new_pl & 0xFF) as u8, new_code, &mut held_bus) {
+					if cpu.pl_esc((new_pl & 0xFF) as u8, 0, &mut held_bus) {
 						//println!("Interrupt {}", new_pl);
 						cpu.waiting.store(false, Ordering::Relaxed);
 					}
